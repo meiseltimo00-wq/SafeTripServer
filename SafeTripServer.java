@@ -1,9 +1,7 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
@@ -27,10 +25,19 @@ public class SafeTripServer {
                     new HashMap<String, List<PrivateMessage>>()
             );
 
-    private static final Map<String, Boolean> presence =
+    /*
+     * Speichert den Zeitpunkt des letzten Heartbeats.
+     */
+    private static final Map<String, Long> presence =
             Collections.synchronizedMap(
-                    new HashMap<String, Boolean>()
+                    new HashMap<String, Long>()
             );
+
+    /*
+     * Nach 15 Sekunden ohne Heartbeat ist der Benutzer offline.
+     */
+    private static final long PRESENCE_TIMEOUT =
+            15000L;
 
     private static final AtomicLong messageCounter =
             new AtomicLong(1);
@@ -657,28 +664,48 @@ public class SafeTripServer {
             return;
         }
 
-        boolean online =
-                status.equalsIgnoreCase(
-                        "online"
-                );
+        /*
+         * Ein Online-Heartbeat aktualisiert
+         * den Zeitstempel.
+         */
+        if (status.equalsIgnoreCase("online")) {
 
-        presence.put(
-                userId,
-                online
+            presence.put(
+                    userId,
+                    System.currentTimeMillis()
+            );
+
+            System.out.println(
+                    "Presence: " +
+                    userId +
+                    " = ONLINE"
+            );
+
+            send(
+                    ex,
+                    "PRESENCE_ONLINE"
+            );
+
+            return;
+        }
+
+        /*
+         * Ein explizites Offline-Signal
+         * entfernt den Benutzer direkt.
+         */
+        presence.remove(
+                userId
         );
 
         System.out.println(
                 "Presence: " +
                 userId +
-                " = " +
-                (online ? "ONLINE" : "OFFLINE")
+                " = OFFLINE"
         );
 
         send(
                 ex,
-                online
-                        ? "PRESENCE_ONLINE"
-                        : "PRESENCE_OFFLINE"
+                "PRESENCE_OFFLINE"
         );
     }
 
@@ -707,11 +734,26 @@ public class SafeTripServer {
             return;
         }
 
-        Boolean online =
-                presence.get(userId);
+        Long lastSeen =
+                presence.get(
+                        userId
+                );
 
-        if (online != null &&
-                online) {
+        if (lastSeen == null) {
+
+            send(
+                    ex,
+                    "OFFLINE"
+            );
+
+            return;
+        }
+
+        long age =
+                System.currentTimeMillis() -
+                lastSeen;
+
+        if (age <= PRESENCE_TIMEOUT) {
 
             send(
                     ex,
@@ -719,6 +761,14 @@ public class SafeTripServer {
             );
 
         } else {
+
+            /*
+             * Alte Einträge werden direkt
+             * entfernt.
+             */
+            presence.remove(
+                    userId
+            );
 
             send(
                     ex,
