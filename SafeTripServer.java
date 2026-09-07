@@ -1,3 +1,4 @@
+ 
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpExchange;
 
@@ -5,6 +6,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class SafeTripServer {
 
@@ -13,10 +15,13 @@ public class SafeTripServer {
                     new HashMap<String, List<String>>()
             );
 
-    private static final Map<String, List<String>> privateChats =
+    private static final Map<String, List<PrivateMessage>> privateChats =
             Collections.synchronizedMap(
-                    new HashMap<String, List<String>>()
+                    new HashMap<String, List<PrivateMessage>>()
             );
+
+    private static final AtomicLong messageCounter =
+            new AtomicLong(1);
 
     public static void main(String[] args) throws Exception {
 
@@ -53,8 +58,17 @@ public class SafeTripServer {
                 SafeTripServer::postPrivateMessage
         );
 
-        server.setExecutor(null);
+        server.createContext(
+                "/private-message-edit",
+                SafeTripServer::editPrivateMessage
+        );
 
+        server.createContext(
+                "/private-message-delete",
+                SafeTripServer::deletePrivateMessage
+        );
+
+        server.setExecutor(null);
         server.start();
 
         System.out.println(
@@ -65,7 +79,7 @@ public class SafeTripServer {
 
     /*
      * ==========================================
-     * COMMUNITY CHAT
+     * COMMUNITY
      * ==========================================
      */
 
@@ -168,13 +182,6 @@ public class SafeTripServer {
             messages.add(
                     message
             );
-
-            System.out.println(
-                    "Saved [" +
-                    room +
-                    "]: " +
-                    message
-            );
         }
 
         send(
@@ -185,7 +192,7 @@ public class SafeTripServer {
 
     /*
      * ==========================================
-     * PRIVATE CHAT
+     * PRIVATE SEND
      * ==========================================
      */
 
@@ -215,23 +222,29 @@ public class SafeTripServer {
                 parseForm(data);
 
         String sender =
-                values.get("sender");
+                cleanId(
+                        values.get("sender")
+                );
 
         String recipient =
-                values.get("recipient");
+                cleanId(
+                        values.get("recipient")
+                );
 
         String senderNick =
-                values.get("senderNick");
+                cleanMessage(
+                        values.get("senderNick")
+                );
 
         String message =
-                values.get("message");
+                cleanMessage(
+                        values.get("message")
+                );
 
-        if (sender == null ||
-                sender.trim().isEmpty() ||
-                recipient == null ||
-                recipient.trim().isEmpty() ||
-                message == null ||
-                message.trim().isEmpty()) {
+        if (sender.isEmpty() ||
+                recipient.isEmpty() ||
+                message.isEmpty() ||
+                sender.equals(recipient)) {
 
             send(
                     ex,
@@ -241,35 +254,9 @@ public class SafeTripServer {
             return;
         }
 
-        sender =
-                cleanId(sender);
-
-        recipient =
-                cleanId(recipient);
-
-        if (sender.isEmpty() ||
-                recipient.isEmpty() ||
-                sender.equals(recipient)) {
-
-            send(
-                    ex,
-                    "INVALID_PRIVATE_CHAT"
-            );
-
-            return;
-        }
-
-        if (senderNick == null ||
-                senderNick.trim().isEmpty()) {
-
+        if (senderNick.isEmpty()) {
             senderNick = "Ich";
         }
-
-        senderNick =
-                cleanMessage(senderNick);
-
-        message =
-                cleanMessage(message);
 
         String chatKey =
                 privateChatKey(
@@ -277,14 +264,14 @@ public class SafeTripServer {
                         recipient
                 );
 
-        List<String> messages =
+        List<PrivateMessage> messages =
                 privateChats.get(chatKey);
 
         if (messages == null) {
 
             messages =
                     Collections.synchronizedList(
-                            new ArrayList<String>()
+                            new ArrayList<PrivateMessage>()
                     );
 
             privateChats.put(
@@ -293,22 +280,24 @@ public class SafeTripServer {
             );
         }
 
-        String saved =
-                sender +
-                "|" +
-                senderNick +
-                ": " +
-                message;
+        String id =
+                "PM-" +
+                messageCounter.getAndIncrement();
 
-        messages.add(
-                saved
-        );
+        PrivateMessage pm =
+                new PrivateMessage(
+                        id,
+                        sender,
+                        recipient,
+                        senderNick,
+                        message
+                );
+
+        messages.add(pm);
 
         System.out.println(
-                "Private [" +
-                chatKey +
-                "]: " +
-                saved
+                "Private message saved: " +
+                id
         );
 
         send(
@@ -317,41 +306,31 @@ public class SafeTripServer {
         );
     }
 
+    /*
+     * ==========================================
+     * PRIVATE LOAD
+     * ==========================================
+     */
+
     private static void getPrivateMessages(
             HttpExchange ex
     ) throws IOException {
 
-        String query =
-                ex.getRequestURI()
-                        .getQuery();
-
         Map<String, String> values =
-                parseQuery(query);
+                parseQuery(
+                        ex.getRequestURI()
+                                .getQuery()
+                );
 
         String sender =
-                values.get("sender");
+                cleanId(
+                        values.get("sender")
+                );
 
         String recipient =
-                values.get("recipient");
-
-        if (sender == null ||
-                recipient == null ||
-                sender.trim().isEmpty() ||
-                recipient.trim().isEmpty()) {
-
-            send(
-                    ex,
-                    "INVALID_PRIVATE_CHAT"
-            );
-
-            return;
-        }
-
-        sender =
-                cleanId(sender);
-
-        recipient =
-                cleanId(recipient);
+                cleanId(
+                        values.get("recipient")
+                );
 
         if (sender.isEmpty() ||
                 recipient.isEmpty() ||
@@ -371,7 +350,7 @@ public class SafeTripServer {
                         recipient
                 );
 
-        List<String> messages =
+        List<PrivateMessage> messages =
                 privateChats.get(chatKey);
 
         if (messages == null ||
@@ -390,43 +369,34 @@ public class SafeTripServer {
 
         synchronized (messages) {
 
-            for (String msg : messages) {
+            for (PrivateMessage pm : messages) {
 
-                int separator =
-                        msg.indexOf('|');
+                if (pm.deleted) {
 
-                if (separator < 0) {
                     continue;
                 }
 
-                String messageSender =
-                        msg.substring(
-                                0,
-                                separator
-                        );
+                body.append(
+                        pm.id
+                );
 
-                String display =
-                        msg.substring(
-                                separator + 1
-                        );
+                body.append("|");
 
-                if (messageSender.equals(sender)) {
+                body.append(
+                        pm.senderId
+                );
 
-                    body.append(
-                            "Ich: "
-                    );
+                body.append("|");
 
-                    body.append(
-                            removeNickPrefix(
-                                    display
-                            ));
+                body.append(
+                        pm.senderNick
+                );
 
-                } else {
+                body.append("|");
 
-                    body.append(
-                            display
-                    );
-                }
+                body.append(
+                        pm.text
+                );
 
                 body.append(
                         "\n"
@@ -456,6 +426,237 @@ public class SafeTripServer {
 
     /*
      * ==========================================
+     * PRIVATE EDIT
+     * ==========================================
+     */
+
+    private static void editPrivateMessage(
+            HttpExchange ex
+    ) throws IOException {
+
+        if (!ex.getRequestMethod()
+                .equalsIgnoreCase("POST")) {
+
+            send(
+                    ex,
+                    "ONLY_POST"
+            );
+
+            return;
+        }
+
+        String data =
+                new String(
+                        ex.getRequestBody()
+                                .readAllBytes(),
+                        StandardCharsets.UTF_8
+                );
+
+        Map<String, String> values =
+                parseForm(data);
+
+        String sender =
+                cleanId(
+                        values.get("sender")
+                );
+
+        String messageId =
+                cleanId(
+                        values.get("messageId")
+                );
+
+        String newText =
+                cleanMessage(
+                        values.get("message")
+                );
+
+        if (sender.isEmpty() ||
+                messageId.isEmpty() ||
+                newText.isEmpty()) {
+
+            send(
+                    ex,
+                    "INVALID_EDIT"
+            );
+
+            return;
+        }
+
+        PrivateMessage pm =
+                findPrivateMessage(
+                        messageId
+                );
+
+        if (pm == null) {
+
+            send(
+                    ex,
+                    "MESSAGE_NOT_FOUND"
+            );
+
+            return;
+        }
+
+        synchronized (pm) {
+
+            if (!pm.senderId.equals(sender)) {
+
+                send(
+                        ex,
+                        "NOT_ALLOWED"
+                );
+
+                return;
+            }
+
+            if (pm.deleted) {
+
+                send(
+                        ex,
+                        "MESSAGE_DELETED"
+                );
+
+                return;
+            }
+
+            pm.text =
+                    newText;
+
+            pm.edited =
+                    true;
+        }
+
+        send(
+                ex,
+                "MESSAGE_EDITED"
+        );
+    }
+
+    /*
+     * ==========================================
+     * PRIVATE DELETE
+     * ==========================================
+     */
+
+    private static void deletePrivateMessage(
+            HttpExchange ex
+    ) throws IOException {
+
+        if (!ex.getRequestMethod()
+                .equalsIgnoreCase("POST")) {
+
+            send(
+                    ex,
+                    "ONLY_POST"
+            );
+
+            return;
+        }
+
+        String data =
+                new String(
+                        ex.getRequestBody()
+                                .readAllBytes(),
+                        StandardCharsets.UTF_8
+                );
+
+        Map<String, String> values =
+                parseForm(data);
+
+        String sender =
+                cleanId(
+                        values.get("sender")
+                );
+
+        String messageId =
+                cleanId(
+                        values.get("messageId")
+                );
+
+        if (sender.isEmpty() ||
+                messageId.isEmpty()) {
+
+            send(
+                    ex,
+                    "INVALID_DELETE"
+            );
+
+            return;
+        }
+
+        PrivateMessage pm =
+                findPrivateMessage(
+                        messageId
+                );
+
+        if (pm == null) {
+
+            send(
+                    ex,
+                    "MESSAGE_NOT_FOUND"
+            );
+
+            return;
+        }
+
+        synchronized (pm) {
+
+            if (!pm.senderId.equals(sender)) {
+
+                send(
+                        ex,
+                        "NOT_ALLOWED"
+                );
+
+                return;
+            }
+
+            pm.deleted =
+                    true;
+        }
+
+        send(
+                ex,
+                "MESSAGE_DELETED"
+        );
+    }
+
+    /*
+     * ==========================================
+     * FIND MESSAGE
+     * ==========================================
+     */
+
+    private static PrivateMessage findPrivateMessage(
+            String messageId
+    ) {
+
+        synchronized (privateChats) {
+
+            for (List<PrivateMessage> list :
+                    privateChats.values()) {
+
+                synchronized (list) {
+
+                    for (PrivateMessage pm :
+                            list) {
+
+                        if (pm.id.equals(
+                                messageId
+                        )) {
+
+                            return pm;
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /*
+     * ==========================================
      * PRIVATE CHAT KEY
      * ==========================================
      */
@@ -477,6 +678,41 @@ public class SafeTripServer {
                 b +
                 "|" +
                 a;
+    }
+
+    /*
+     * ==========================================
+     * MESSAGE OBJECT
+     * ==========================================
+     */
+
+    private static class PrivateMessage {
+
+        String id;
+        String senderId;
+        String recipientId;
+        String senderNick;
+        String text;
+
+        boolean edited;
+        boolean deleted;
+
+        PrivateMessage(
+                String id,
+                String senderId,
+                String recipientId,
+                String senderNick,
+                String text
+        ) {
+
+            this.id = id;
+            this.senderId = senderId;
+            this.recipientId = recipientId;
+            this.senderNick = senderNick;
+            this.text = text;
+            this.edited = false;
+            this.deleted = false;
+        }
     }
 
     /*
@@ -562,12 +798,6 @@ public class SafeTripServer {
             String query
     ) {
 
-        if (query == null ||
-                query.isEmpty()) {
-
-            return "Community";
-        }
-
         Map<String, String> values =
                 parseQuery(query);
 
@@ -585,7 +815,7 @@ public class SafeTripServer {
 
     /*
      * ==========================================
-     * CLEANING
+     * CLEAN
      * ==========================================
      */
 
@@ -613,30 +843,10 @@ public class SafeTripServer {
         }
 
         return message
+                .replace("|", " ")
                 .replace("\r", " ")
                 .replace("\n", " ")
                 .trim();
-    }
-
-    private static String removeNickPrefix(
-            String text
-    ) {
-
-        if (text == null) {
-            return "";
-        }
-
-        int pos =
-                text.indexOf(": ");
-
-        if (pos >= 0) {
-
-            return text.substring(
-                    pos + 2
-            );
-        }
-
-        return text;
     }
 
     /*
@@ -674,7 +884,6 @@ public class SafeTripServer {
                 ex.getResponseBody();
 
         out.write(bytes);
-
         out.close();
     }
 }
