@@ -1,11 +1,18 @@
- 
-import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 
-import java.io.*;
-import java.net.*;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class SafeTripServer {
@@ -20,17 +27,23 @@ public class SafeTripServer {
                     new HashMap<String, List<PrivateMessage>>()
             );
 
+    private static final Map<String, Boolean> presence =
+            Collections.synchronizedMap(
+                    new HashMap<String, Boolean>()
+            );
+
     private static final AtomicLong messageCounter =
             new AtomicLong(1);
 
     public static void main(String[] args) throws Exception {
 
-        int port = Integer.parseInt(
-                System.getenv().getOrDefault(
-                        "PORT",
-                        "8080"
-                )
-        );
+        int port =
+                Integer.parseInt(
+                        System.getenv().getOrDefault(
+                                "PORT",
+                                "8080"
+                        )
+                );
 
         HttpServer server =
                 HttpServer.create(
@@ -68,7 +81,13 @@ public class SafeTripServer {
                 SafeTripServer::deletePrivateMessage
         );
 
+        server.createContext(
+                "/presence",
+                SafeTripServer::presence
+        );
+
         server.setExecutor(null);
+
         server.start();
 
         System.out.println(
@@ -76,12 +95,6 @@ public class SafeTripServer {
                 port
         );
     }
-
-    /*
-     * ==========================================
-     * COMMUNITY
-     * ==========================================
-     */
 
     private static void getMessages(
             HttpExchange ex
@@ -190,12 +203,6 @@ public class SafeTripServer {
         );
     }
 
-    /*
-     * ==========================================
-     * PRIVATE SEND
-     * ==========================================
-     */
-
     private static void postPrivateMessage(
             HttpExchange ex
     ) throws IOException {
@@ -255,6 +262,7 @@ public class SafeTripServer {
         }
 
         if (senderNick.isEmpty()) {
+
             senderNick = "Ich";
         }
 
@@ -305,12 +313,6 @@ public class SafeTripServer {
                 "PRIVATE_MESSAGE_SAVED"
         );
     }
-
-    /*
-     * ==========================================
-     * PRIVATE LOAD
-     * ==========================================
-     */
 
     private static void getPrivateMessages(
             HttpExchange ex
@@ -369,38 +371,23 @@ public class SafeTripServer {
 
         synchronized (messages) {
 
-            for (PrivateMessage pm : messages) {
+            for (
+                    PrivateMessage pm :
+                    messages
+            ) {
 
                 if (pm.deleted) {
-
                     continue;
                 }
 
-                body.append(
-                        pm.id
-                );
-
+                body.append(pm.id);
                 body.append("|");
-
-                body.append(
-                        pm.senderId
-                );
-
+                body.append(pm.senderId);
                 body.append("|");
-
-                body.append(
-                        pm.senderNick
-                );
-
+                body.append(pm.senderNick);
                 body.append("|");
-
-                body.append(
-                        pm.text
-                );
-
-                body.append(
-                        "\n"
-                );
+                body.append(pm.text);
+                body.append("\n");
             }
         }
 
@@ -423,12 +410,6 @@ public class SafeTripServer {
                 body.toString()
         );
     }
-
-    /*
-     * ==========================================
-     * PRIVATE EDIT
-     * ==========================================
-     */
 
     private static void editPrivateMessage(
             HttpExchange ex
@@ -532,12 +513,6 @@ public class SafeTripServer {
         );
     }
 
-    /*
-     * ==========================================
-     * PRIVATE DELETE
-     * ==========================================
-     */
-
     private static void deletePrivateMessage(
             HttpExchange ex
     ) throws IOException {
@@ -621,11 +596,136 @@ public class SafeTripServer {
         );
     }
 
-    /*
-     * ==========================================
-     * FIND MESSAGE
-     * ==========================================
-     */
+    private static void presence(
+            HttpExchange ex
+    ) throws IOException {
+
+        String method =
+                ex.getRequestMethod();
+
+        if (method.equalsIgnoreCase("POST")) {
+
+            setPresence(ex);
+
+            return;
+        }
+
+        if (method.equalsIgnoreCase("GET")) {
+
+            getPresence(ex);
+
+            return;
+        }
+
+        send(
+                ex,
+                "ONLY_GET_OR_POST"
+        );
+    }
+
+    private static void setPresence(
+            HttpExchange ex
+    ) throws IOException {
+
+        String data =
+                new String(
+                        ex.getRequestBody()
+                                .readAllBytes(),
+                        StandardCharsets.UTF_8
+                );
+
+        Map<String, String> values =
+                parseForm(data);
+
+        String userId =
+                cleanId(
+                        values.get("userId")
+                );
+
+        String status =
+                cleanId(
+                        values.get("status")
+                );
+
+        if (userId.isEmpty()) {
+
+            send(
+                    ex,
+                    "INVALID_USER"
+            );
+
+            return;
+        }
+
+        boolean online =
+                status.equalsIgnoreCase(
+                        "online"
+                );
+
+        presence.put(
+                userId,
+                online
+        );
+
+        System.out.println(
+                "Presence: " +
+                userId +
+                " = " +
+                (online ? "ONLINE" : "OFFLINE")
+        );
+
+        send(
+                ex,
+                online
+                        ? "PRESENCE_ONLINE"
+                        : "PRESENCE_OFFLINE"
+        );
+    }
+
+    private static void getPresence(
+            HttpExchange ex
+    ) throws IOException {
+
+        Map<String, String> values =
+                parseQuery(
+                        ex.getRequestURI()
+                                .getQuery()
+                );
+
+        String userId =
+                cleanId(
+                        values.get("userId")
+                );
+
+        if (userId.isEmpty()) {
+
+            send(
+                    ex,
+                    "INVALID_USER"
+            );
+
+            return;
+        }
+
+        Boolean online =
+                presence.get(userId);
+
+        if (online != null &&
+                online) {
+
+            send(
+                    ex,
+                    "ONLINE"
+            );
+
+        } else {
+
+            send(
+                    ex,
+                    "OFFLINE"
+            );
+        }
+    }
 
     private static PrivateMessage findPrivateMessage(
             String messageId
@@ -633,13 +733,17 @@ public class SafeTripServer {
 
         synchronized (privateChats) {
 
-            for (List<PrivateMessage> list :
-                    privateChats.values()) {
+            for (
+                    List<PrivateMessage> list :
+                    privateChats.values()
+            ) {
 
                 synchronized (list) {
 
-                    for (PrivateMessage pm :
-                            list) {
+                    for (
+                            PrivateMessage pm :
+                            list
+                    ) {
 
                         if (pm.id.equals(
                                 messageId
@@ -654,12 +758,6 @@ public class SafeTripServer {
 
         return null;
     }
-
-    /*
-     * ==========================================
-     * PRIVATE CHAT KEY
-     * ==========================================
-     */
 
     private static String privateChatKey(
             String a,
@@ -680,12 +778,6 @@ public class SafeTripServer {
                 a;
     }
 
-    /*
-     * ==========================================
-     * MESSAGE OBJECT
-     * ==========================================
-     */
-
     private static class PrivateMessage {
 
         String id;
@@ -705,21 +797,28 @@ public class SafeTripServer {
                 String text
         ) {
 
-            this.id = id;
-            this.senderId = senderId;
-            this.recipientId = recipientId;
-            this.senderNick = senderNick;
-            this.text = text;
-            this.edited = false;
-            this.deleted = false;
+            this.id =
+                    id;
+
+            this.senderId =
+                    senderId;
+
+            this.recipientId =
+                    recipientId;
+
+            this.senderNick =
+                    senderNick;
+
+            this.text =
+                    text;
+
+            this.edited =
+                    false;
+
+            this.deleted =
+                    false;
         }
     }
-
-    /*
-     * ==========================================
-     * FORM / QUERY
-     * ==========================================
-     */
 
     private static Map<String, String> parseForm(
             String data
@@ -788,12 +887,6 @@ public class SafeTripServer {
         );
     }
 
-    /*
-     * ==========================================
-     * COMMUNITY ROOM
-     * ==========================================
-     */
-
     private static String getRoomFromQuery(
             String query
     ) {
@@ -812,12 +905,6 @@ public class SafeTripServer {
 
         return room;
     }
-
-    /*
-     * ==========================================
-     * CLEAN
-     * ==========================================
-     */
 
     private static String cleanId(
             String id
@@ -848,12 +935,6 @@ public class SafeTripServer {
                 .replace("\n", " ")
                 .trim();
     }
-
-    /*
-     * ==========================================
-     * RESPONSE
-     * ==========================================
-     */
 
     private static void send(
             HttpExchange ex,
