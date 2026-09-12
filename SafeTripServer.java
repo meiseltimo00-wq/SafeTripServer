@@ -1,6 +1,7 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-
+ 
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -188,7 +189,11 @@ public class SafeTripServer {
         if (!ex.getRequestMethod().equalsIgnoreCase("GET")) { send(ex, "ONLY_GET"); return; }
         StringBuilder body = new StringBuilder();
         synchronized (forumPosts) {
-            for (ForumPost post : forumPosts) if (!post.deleted) body.append(post.id).append('|').append(post.ownerId).append('|').append(post.nick).append('|').append(post.title).append('|').append(post.message).append('|').append(post.anonymous ? "1" : "0").append('\n');
+            List<ForumPost> sorted = new ArrayList<ForumPost>(forumPosts);
+            Collections.sort(sorted, new Comparator<ForumPost>() {
+                @Override public int compare(ForumPost a, ForumPost b) { return Long.compare(extractNumber(b.id), extractNumber(a.id)); }
+            });
+            for (ForumPost post : sorted) if (!post.deleted) body.append(post.id).append('|').append(post.ownerId).append('|').append(post.nick).append('|').append(post.title).append('|').append(post.message).append('|').append(post.anonymous ? "1" : "0").append('|').append(post.upVotes).append('|').append(post.downVotes).append('|').append(countReplies(post.id)).append('\n');
         }
         if (body.length() == 0) { send(ex, "NO_FORUM_POSTS"); return; }
         body.setLength(body.length() - 1); send(ex, body.toString());
@@ -249,7 +254,12 @@ public class SafeTripServer {
         if (findForumPost(postId) == null) { send(ex, "FORUM_POST_NOT_FOUND"); return; }
         StringBuilder body = new StringBuilder();
         synchronized (forumReplies) {
-            for (ForumReply reply : forumReplies) if (reply.postId.equals(postId) && !reply.deleted) body.append(reply.id).append('|').append(reply.ownerId).append('|').append(reply.nick).append('|').append(reply.message).append('|').append(reply.anonymous ? "1" : "0").append('\n');
+            List<ForumReply> sorted = new ArrayList<ForumReply>();
+            for (ForumReply reply : forumReplies) if (reply.postId.equals(postId) && !reply.deleted) sorted.add(reply);
+            Collections.sort(sorted, new Comparator<ForumReply>() {
+                @Override public int compare(ForumReply a, ForumReply b) { return Long.compare(extractNumber(b.id), extractNumber(a.id)); }
+            });
+            for (ForumReply reply : sorted) body.append(reply.id).append('|').append(reply.ownerId).append('|').append(reply.nick).append('|').append(reply.message).append('|').append(reply.anonymous ? "1" : "0").append('\n');
         }
         if (body.length() == 0) { send(ex, "NO_FORUM_REPLIES"); return; }
         body.setLength(body.length() - 1); send(ex, body.toString());
@@ -274,23 +284,26 @@ public class SafeTripServer {
     private static void voteForumPost(HttpExchange ex) throws IOException {
         if (!ex.getRequestMethod().equalsIgnoreCase("POST")) { send(ex, "ONLY_POST"); return; }
         Map<String, String> values = parseForm(readBody(ex));
-        String postId = cleanId(values.get("postId"));
-        String userId = cleanId(values.get("userId"));
-        String voteValue = cleanId(values.get("vote"));
-        if (postId.isEmpty() || userId.isEmpty()) { send(ex, "INVALID_FORUM_VOTE"); return; }
-        int vote;
-        try { vote = Integer.parseInt(voteValue); } catch (Exception e) { send(ex, "INVALID_FORUM_VOTE"); return; }
-        if (vote != -1 && vote != 0 && vote != 1) { send(ex, "INVALID_FORUM_VOTE"); return; }
+        String postId = cleanId(values.get("postId")); String userId = cleanId(values.get("userId"));
+        String vote = cleanId(values.get("vote"));
+        if (postId.isEmpty() || userId.isEmpty() || (!vote.equals("up") && !vote.equals("down") && !vote.equals("none"))) { send(ex, "INVALID_FORUM_VOTE"); return; }
         ForumPost post = findForumPost(postId);
         if (post == null || post.deleted) { send(ex, "FORUM_POST_NOT_FOUND"); return; }
         synchronized (forumVotes) {
-            Map<String, Integer> votes = forumVotes.get(postId);
-            if (votes == null) { votes = new HashMap<String, Integer>(); forumVotes.put(postId, votes); }
-            if (vote == 0) votes.remove(userId); else votes.put(userId, vote);
-            rebuildForumVoteCountsLocked();
+            Map<String, Integer> users = forumVotes.get(postId);
+            if (users == null) { users = new HashMap<String, Integer>(); forumVotes.put(postId, users); }
+            Integer old = users.get(userId);
+            if (old != null) {
+                if (old == 1) post.upVotes--;
+                if (old == -1) post.downVotes--;
+            }
+            if (vote.equals("up")) { users.put(userId, 1); post.upVotes++; }
+            else if (vote.equals("down")) { users.put(userId, -1); post.downVotes++; }
+            else users.remove(userId);
+            if (users.isEmpty()) forumVotes.remove(postId);
         }
         savePersistentData();
-        send(ex, Integer.toString(post.score));
+        send(ex, post.upVotes + "|" + post.downVotes);
     }
 
     private static ForumPost findForumPost(String id) {
@@ -300,190 +313,217 @@ public class SafeTripServer {
 
     private static PrivateMessage findPrivateMessage(String id) {
         synchronized (privateChats) {
-            for (List<PrivateMessage> list : privateChats.values()) synchronized (list) {
-                for (PrivateMessage pm : list) if (pm.id.equals(id)) return pm;
-            }
+            for (List<PrivateMessage> list : privateChats.values()) synchronized (list) { for (PrivateMessage pm : list) if (pm.id.equals(id)) return pm; }
         }
         return null;
     }
 
-    private static String privateChatKey(String a, String b) { return a.compareTo(b) < 0 ? "PRIVATE|" + a + "|" + b : "PRIVATE|" + b + "|" + a; }
-    private static String getRoomFromQuery(String query) { String room = cleanMessage(parseQuery(query).get("room")); return room.isEmpty() ? "Community" : room; }
-    private static String readBody(HttpExchange ex) throws IOException { return new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8); }
-    private static Map<String, String> parseForm(String data) { return parseParameters(data); }
-    private static Map<String, String> parseQuery(String data) { return parseParameters(data == null ? "" : data); }
-
-    private static Map<String, String> parseParameters(String data) {
-        Map<String, String> result = new HashMap<String, String>();
-        if (data == null || data.isEmpty()) return result;
-        for (String part : data.split("&")) {
-            if (part.isEmpty()) continue;
-            int p = part.indexOf('=');
-            if (p < 0) continue;
-            try {
-                result.put(URLDecoder.decode(part.substring(0, p), "UTF-8"), URLDecoder.decode(part.substring(p + 1), "UTF-8"));
-            } catch (Exception ignored) {
-            }
-        }
-        return result;
+    private static int countReplies(String postId) {
+        int count = 0;
+        synchronized (forumReplies) { for (ForumReply reply : forumReplies) if (reply.postId.equals(postId) && !reply.deleted) count++; }
+        return count;
     }
 
-    private static String cleanId(String value) { if (value == null) return ""; return value.replace("|", "_").replace("\n", "_").replace("\r", "_").trim(); }
-    private static String cleanMessage(String value) { if (value == null) return ""; return value.replace("|", " ").replace("\r", " ").replace("\n", " ").trim(); }
-
-    private static void send(HttpExchange ex, String text) throws IOException {
-        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", "text/plain; charset=UTF-8");
-        ex.getResponseHeaders().set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-        ex.sendResponseHeaders(200, bytes.length);
-        OutputStream out = ex.getResponseBody();
-        out.write(bytes);
-        out.close();
+    private static long extractNumber(String id) {
+        if (id == null) return 0L;
+        int dash = id.lastIndexOf('-');
+        if (dash < 0) return 0L;
+        try { return Long.parseLong(id.substring(dash + 1)); } catch (Exception e) { return 0L; }
     }
 
     private static void savePersistentData() {
+        if (dataFile == null) return;
         synchronized (DATA_LOCK) {
-            if (dataFile == null) return;
             try {
-                Path absolute = dataFile.toAbsolutePath();
-                Path parent = absolute.getParent();
+                Path parent = dataFile.toAbsolutePath().getParent();
                 if (parent != null) Files.createDirectories(parent);
-
-                StringBuilder data = new StringBuilder();
-                data.append("SAFETRIP_DATA_V1\n");
-                data.append("COUNTERS|").append(messageCounter.get()).append('|').append(forumCounter.get()).append('|').append(replyCounter.get()).append('\n');
-
+                List<String> lines = new ArrayList<String>();
+                lines.add("VERSION|2");
+                lines.add("COUNTERS|" + messageCounter.get() + "|" + forumCounter.get() + "|" + replyCounter.get());
                 synchronized (forumPosts) {
-                    for (ForumPost post : forumPosts) {
-                        data.append("POST|").append(encode(post.id)).append('|').append(encode(post.ownerId)).append('|').append(encode(post.nick)).append('|').append(encode(post.title)).append('|').append(encode(post.message)).append('|').append(post.anonymous ? '1' : '0').append('|').append(post.deleted ? '1' : '0').append('\n');
-                    }
+                    for (ForumPost p : forumPosts) lines.add("POST|" + enc(p.id) + "|" + enc(p.ownerId) + "|" + enc(p.nick) + "|" + enc(p.title) + "|" + enc(p.message) + "|" + (p.anonymous ? "1" : "0") + "|" + (p.deleted ? "1" : "0") + "|" + p.upVotes + "|" + p.downVotes);
                 }
                 synchronized (forumReplies) {
-                    for (ForumReply reply : forumReplies) {
-                        data.append("REPLY|").append(encode(reply.id)).append('|').append(encode(reply.postId)).append('|').append(encode(reply.ownerId)).append('|').append(encode(reply.nick)).append('|').append(encode(reply.message)).append('|').append(reply.anonymous ? '1' : '0').append('|').append(reply.deleted ? '1' : '0').append('\n');
-                    }
+                    for (ForumReply r : forumReplies) lines.add("REPLY|" + enc(r.id) + "|" + enc(r.postId) + "|" + enc(r.ownerId) + "|" + enc(r.nick) + "|" + enc(r.message) + "|" + (r.anonymous ? "1" : "0") + "|" + (r.deleted ? "1" : "0"));
                 }
                 synchronized (forumVotes) {
-                    for (Map.Entry<String, Map<String, Integer>> postEntry : forumVotes.entrySet()) {
-                        for (Map.Entry<String, Integer> voteEntry : postEntry.getValue().entrySet()) {
-                            data.append("VOTE|").append(encode(postEntry.getKey())).append('|').append(encode(voteEntry.getKey())).append('|').append(voteEntry.getValue()).append('\n');
-                        }
+                    for (Map.Entry<String, Map<String, Integer>> entry : forumVotes.entrySet()) {
+                        for (Map.Entry<String, Integer> vote : entry.getValue().entrySet()) lines.add("VOTE|" + enc(entry.getKey()) + "|" + enc(vote.getKey()) + "|" + vote.getValue());
                     }
                 }
-
-                Path temp = absolute.resolveSibling(absolute.getFileName().toString() + ".tmp");
-                Files.write(temp, data.toString().getBytes(StandardCharsets.UTF_8));
-                try {
-                    Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                } catch (Exception ignored) {
-                    Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING);
-                }
-            } catch (Exception e) {
-                System.err.println("Fehler beim Speichern der SafeTrip-Daten: " + e.getMessage());
-            }
+                Path temp = Paths.get(dataFile.toString() + ".tmp");
+                Files.write(temp, lines, StandardCharsets.UTF_8);
+                try { Files.move(temp, dataFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
+                catch (Exception e) { Files.move(temp, dataFile, StandardCopyOption.REPLACE_EXISTING); }
+            } catch (Exception e) { System.out.println("Speichern fehlgeschlagen: " + e.getMessage()); }
         }
     }
 
     private static void loadPersistentData() {
+        if (dataFile == null || !Files.exists(dataFile)) return;
         synchronized (DATA_LOCK) {
-            if (dataFile == null || !Files.exists(dataFile)) return;
             try {
                 List<String> lines = Files.readAllLines(dataFile, StandardCharsets.UTF_8);
-                long maxForum = 0;
-                long maxReply = 0;
                 synchronized (forumPosts) { forumPosts.clear(); }
                 synchronized (forumReplies) { forumReplies.clear(); }
                 synchronized (forumVotes) { forumVotes.clear(); }
-
+                long maxMessage = 0L, maxForum = 0L, maxReply = 0L;
                 for (String line : lines) {
-                    if (line == null || line.isEmpty()) continue;
-                    String[] p = line.split("\\|", -1);
-                    if (p.length == 0) continue;
-                    if ("COUNTERS".equals(p[0]) && p.length >= 4) {
-                        messageCounter.set(Math.max(1, parseLong(p[1])));
-                        forumCounter.set(Math.max(1, parseLong(p[2])));
-                        replyCounter.set(Math.max(1, parseLong(p[3])));
-                    } else if ("POST".equals(p[0]) && p.length >= 8) {
-                        ForumPost post = new ForumPost(decode(p[1]), decode(p[2]), decode(p[3]), decode(p[4]), decode(p[5]), "1".equals(p[6]));
-                        post.deleted = "1".equals(p[7]);
-                        forumPosts.add(post);
-                        maxForum = Math.max(maxForum, parseNumericId(post.id, "FP-"));
-                    } else if ("REPLY".equals(p[0]) && p.length >= 8) {
-                        ForumReply reply = new ForumReply(decode(p[1]), decode(p[2]), decode(p[3]), decode(p[4]), decode(p[5]), "1".equals(p[6]));
-                        reply.deleted = "1".equals(p[7]);
-                        forumReplies.add(reply);
-                        maxReply = Math.max(maxReply, parseNumericId(reply.id, "FR-"));
-                    } else if ("VOTE".equals(p[0]) && p.length >= 4) {
-                        int vote = parseInt(p[3]);
-                        if (vote == -1 || vote == 1) {
-                            Map<String, Integer> votes = forumVotes.get(decode(p[1]));
-                            if (votes == null) { votes = new HashMap<String, Integer>(); forumVotes.put(decode(p[1]), votes); }
-                            votes.put(decode(p[2]), vote);
+                    if (line.startsWith("COUNTERS|")) {
+                        String[] p = line.split("\\|", -1);
+                        if (p.length >= 4) {
+                            try { messageCounter.set(Long.parseLong(p[1])); } catch (Exception ignored) { }
+                            try { forumCounter.set(Long.parseLong(p[2])); } catch (Exception ignored) { }
+                            try { replyCounter.set(Long.parseLong(p[3])); } catch (Exception ignored) { }
+                        }
+                    } else if (line.startsWith("POST|")) {
+                        String[] p = line.split("\\|", -1);
+                        if (p.length >= 10) {
+                            ForumPost post = new ForumPost(dec(p[1]), dec(p[2]), dec(p[3]), dec(p[4]), dec(p[5]), "1".equals(p[6]));
+                            post.deleted = "1".equals(p[7]);
+                            try { post.upVotes = Integer.parseInt(p[8]); } catch (Exception ignored) { }
+                            try { post.downVotes = Integer.parseInt(p[9]); } catch (Exception ignored) { }
+                            forumPosts.add(post); maxForum = Math.max(maxForum, extractNumber(post.id));
+                        }
+                    } else if (line.startsWith("REPLY|")) {
+                        String[] p = line.split("\\|", -1);
+                        if (p.length >= 8) {
+                            ForumReply reply = new ForumReply(dec(p[1]), dec(p[2]), dec(p[3]), dec(p[4]), dec(p[5]), "1".equals(p[6]));
+                            reply.deleted = "1".equals(p[7]);
+                            forumReplies.add(reply); maxReply = Math.max(maxReply, extractNumber(reply.id));
+                        }
+                    } else if (line.startsWith("VOTE|")) {
+                        String[] p = line.split("\\|", -1);
+                        if (p.length >= 4) {
+                            Map<String, Integer> users = forumVotes.get(dec(p[1]));
+                            if (users == null) { users = new HashMap<String, Integer>(); forumVotes.put(dec(p[1]), users); }
+                            try { users.put(dec(p[2]), Integer.parseInt(p[3])); } catch (Exception ignored) { }
                         }
                     }
                 }
-
-                forumCounter.set(Math.max(forumCounter.get(), maxForum + 1));
-                replyCounter.set(Math.max(replyCounter.get(), maxReply + 1));
+                if (forumCounter.get() <= maxForum) forumCounter.set(maxForum + 1);
+                if (replyCounter.get() <= maxReply) replyCounter.set(maxReply + 1);
+                if (messageCounter.get() <= maxMessage) messageCounter.set(maxMessage + 1);
                 rebuildForumVoteCounts();
-                System.out.println("SafeTrip-Daten geladen: " + forumPosts.size() + " Beiträge, " + forumReplies.size() + " Antworten.");
-            } catch (Exception e) {
-                System.err.println("Fehler beim Laden der SafeTrip-Daten: " + e.getMessage());
-            }
+            } catch (Exception e) { System.out.println("Laden fehlgeschlagen: " + e.getMessage()); }
         }
     }
 
     private static void rebuildForumVoteCounts() {
-        synchronized (forumVotes) { rebuildForumVoteCountsLocked(); }
-    }
-
-    private static void rebuildForumVoteCountsLocked() {
-        synchronized (forumPosts) {
-            for (ForumPost post : forumPosts) {
-                int score = 0;
-                Map<String, Integer> votes = forumVotes.get(post.id);
-                if (votes != null) for (Integer value : votes.values()) if (value != null) score += value;
-                post.score = score;
+        synchronized (forumPosts) { for (ForumPost post : forumPosts) { post.upVotes = 0; post.downVotes = 0; } }
+        synchronized (forumVotes) {
+            for (Map.Entry<String, Map<String, Integer>> entry : forumVotes.entrySet()) {
+                ForumPost post = findForumPost(entry.getKey());
+                if (post == null) continue;
+                for (Integer vote : entry.getValue().values()) {
+                    if (vote != null && vote == 1) post.upVotes++;
+                    else if (vote != null && vote == -1) post.downVotes++;
+                }
             }
         }
     }
 
-    private static String encode(String value) {
-        if (value == null) return "";
+    private static String enc(String value) {
+        if (value == null) value = "";
         return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String decode(String value) {
+    private static String dec(String value) {
         if (value == null || value.isEmpty()) return "";
         try { return new String(java.util.Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8); }
-        catch (Exception e) { return ""; }
+        catch (Exception e) { return value; }
     }
 
-    private static long parseLong(String value) { try { return Long.parseLong(value); } catch (Exception e) { return 0L; } }
-    private static int parseInt(String value) { try { return Integer.parseInt(value); } catch (Exception e) { return 0; } }
-    private static long parseNumericId(String id, String prefix) { if (id == null) return 0L; return parseLong(id.startsWith(prefix) ? id.substring(prefix.length()) : id); }
+    private static String readBody(HttpExchange ex) throws IOException {
+        StringBuilder body = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new java.io.InputStreamReader(ex.getRequestBody(), StandardCharsets.UTF_8))) {
+            String line; while ((line = reader.readLine()) != null) body.append(line);
+        }
+        return body.toString();
+    }
+
+    private static Map<String, String> parseForm(String body) {
+        return parseQuery(body);
+    }
+
+    private static Map<String, String> parseQuery(String query) {
+        Map<String, String> result = new HashMap<String, String>();
+        if (query == null || query.isEmpty()) return result;
+        String[] pairs = query.split("&");
+        for (String pair : pairs) {
+            int eq = pair.indexOf('=');
+            String key = eq >= 0 ? pair.substring(0, eq) : pair;
+            String value = eq >= 0 ? pair.substring(eq + 1) : "";
+            try { key = URLDecoder.decode(key, "UTF-8"); value = URLDecoder.decode(value, "UTF-8"); } catch (Exception ignored) { }
+            result.put(key, value);
+        }
+        return result;
+    }
+
+    private static String getRoomFromQuery(String query) {
+        String room = cleanMessage(parseQuery(query).get("room"));
+        return room.isEmpty() ? "Community" : room;
+    }
+
+    private static String privateChatKey(String a, String b) {
+        return a.compareTo(b) < 0 ? a + "|" + b : b + "|" + a;
+    }
+
+    private static String cleanId(String value) {
+        if (value == null) return "";
+        return value.trim().replace("|", "").replace("\n", "").replace("\r", "");
+    }
+
+    private static String cleanMessage(String value) {
+        if (value == null) return "";
+        return value.replace("|", " ").replace("\r", "").replace("\n", " ").trim();
+    }
+
+    private static void send(HttpExchange ex, String body) throws IOException {
+        byte[] data = body.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "text/plain; charset=UTF-8");
+        ex.getResponseHeaders().set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        ex.getResponseHeaders().set("Pragma", "no-cache");
+        ex.sendResponseHeaders(200, data.length);
+        try (OutputStream out = ex.getResponseBody()) { out.write(data); }
+    }
 
     private static class PrivateMessage {
-        String id, senderId, recipientId, senderNick, text;
-        boolean edited, deleted;
+        final String id;
+        final String senderId;
+        final String recipientId;
+        final String senderNick;
+        String text;
+        boolean edited;
+        boolean deleted;
         PrivateMessage(String id, String senderId, String recipientId, String senderNick, String text) {
             this.id = id; this.senderId = senderId; this.recipientId = recipientId; this.senderNick = senderNick; this.text = text;
         }
     }
 
     private static class ForumPost {
-        String id, ownerId, nick, title, message;
-        boolean anonymous, deleted;
-        int score;
+        final String id;
+        final String ownerId;
+        final String nick;
+        String title;
+        String message;
+        final boolean anonymous;
+        boolean deleted;
+        int upVotes;
+        int downVotes;
         ForumPost(String id, String ownerId, String nick, String title, String message, boolean anonymous) {
             this.id = id; this.ownerId = ownerId; this.nick = nick; this.title = title; this.message = message; this.anonymous = anonymous;
         }
     }
 
     private static class ForumReply {
-        String id, postId, ownerId, nick, message;
-        boolean anonymous, deleted;
+        final String id;
+        final String postId;
+        final String ownerId;
+        final String nick;
+        final String message;
+        final boolean anonymous;
+        boolean deleted;
         ForumReply(String id, String postId, String ownerId, String nick, String message, boolean anonymous) {
             this.id = id; this.postId = postId; this.ownerId = ownerId; this.nick = nick; this.message = message; this.anonymous = anonymous;
         }
